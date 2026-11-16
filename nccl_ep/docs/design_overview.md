@@ -17,9 +17,10 @@
 | 9 主机编排 | host 如何把意图转成 kernel 序列 | 决策树 + 参数打包，模板交给 JIT | `nccl_ep.cc:5535-8129` |
 | 10–14 LL | 小消息如何做到微秒级 | 双 bank epoch + flag 协议 + LSA/TMA | `device/ll_ep.cuh` |
 | 15–18 HT | 大消息如何打满两条链路 | 分层流水 + scan/count 元数据 + flow 选择 | `device/ht_ep.cuh` |
-| 19 JIT | 特化维度爆炸怎么办 | 编译期常量化 + 三级缓存 | `device/jit/jit_runtime.cc` |
-| 20 量化 | 如何降低 wire 字节数 | FWD/DSFP8/MXFP8/NVFP4 四种 recipe | `quantization_recipe.hpp` |
-| 21 运维与约定 | 如何安全部署与修改 | env / 兼容矩阵 / 编码规范 | `nccl_ep_env.cc`, `docs/agents/` |
+| 19–23 缓冲区设计 | 静态地址与动态路由如何共存 | 上界预留 + 大块对称窗口 + 互斥复用 + offset-only | `common.hpp`, `nccl_ep.cc:1349-2129` |
+| 24 JIT | 特化维度爆炸怎么办 | 编译期常量化 + 三级缓存 | `device/jit/jit_runtime.cc` |
+| 25 量化 | 如何降低 wire 字节数 | FWD/DSFP8/MXFP8/NVFP4 四种 recipe | `quantization_recipe.hpp` |
+| 26 运维与约定 | 如何安全部署与修改 | env / 兼容矩阵 / 编码规范 | `nccl_ep_env.cc`, `docs/agents/` |
 | 附录 | 名词、不变量、源码索引 | — | — |
 
 ---
@@ -354,9 +355,128 @@ RED 累加（`device/ht_ep.cuh:2750-2869`）：`float2 acc[NUM_ACC]`，`NUM_ACC 
 
 ---
 
-# 第六部分：支撑机制
+# 第六部分：缓冲区设计与分配原则
 
-## 19. JIT
+## 19. 总原则：静态地址与动态路由的张力
+
+> **本章解决的问题**：路由是数据相关的，但远端写入的地址必须在通信开始前确定。
+> **解决思路**：内部 staging 按上界静态预留，按"是否同时存在"决定复用，按"是否远端寻址"决定分配方式。
+
+由此推出四条贯穿全局的原则：
+
+| 原则 | 做法 | 原因 |
+|---|---|---|
+| 静态容量、上界预留 | staging 按 `max_dispatch/recv_tokens × max_token_bytes` 分配 | peer 以"行号 × stride"寻址，每行必须容纳最大物理宽度，少一字节即可能越界 |
+| 远端直接寻址的合并成大块对称窗口 | 一次 `ncclMemAlloc` + 一次 `ncclCommWindowRegister(..., NCCL_WIN_COLL_SYMMETRIC)`，内部按 offset 切段 | window 注册是集合操作和死锁敏感点；一个大块 = 一次注册 + 一次 peer 解析 + kernel 参数只持一个基址 |
+| 互斥即复用 | 按"是否同时存在"共享/别名，取各场景最大值 | LL 的 dispatch/combine 共享 payload 槽、AFD 四区别名，都是为了省显存 |
+| 只存 offset 不存绝对地址 | handle 存相对基址的偏移，使用时才解析 `group->rdma_buffer` | AUTO 模式下可集体 realloc，已存在的 handle 不会失效 |
+
+按"分配方式"分为四类内存，这条线决定了所有取舍：
+
+| 类别 | 分配器 | 窗口 | 生命周期 |
+|---|---|---|---|
+| 节点内 IPC mega-buffer | `ncclMemAlloc` | 对称窗口 | group |
+| 跨节点 GIN mega-buffer | `ncclMemAlloc` | GIN 窗口 | group |
+| 组共享 scratch / workspace | `alloc_fn`（可自定义） | 无 | group（部分 lazy） |
+| handle 状态块 | `alloc_fn` 或调用方 `handle_mem` | 可选 | handle |
+
+自定义 allocator **只用于不进 NCCL 窗口的内存**（`nccl_ep.cc:2448-2458, 1737-1782`）：只有 `ncclMemAlloc` 才能保证对称窗口注册与 RDMA 可达性；`cudaHostAlloc` 保留给 mapped host 指针表。
+
+## 20. 对齐层级与硬件原因
+
+> **本章解决的问题**：为什么代码里出现 16/128/256/4096 四种对齐粒度。
+> **解决思路**：每一级都对应一种硬件事务粒度或地址同余类要求。
+
+| 对齐 | 用在哪里 | 原因 |
+|---|---|---|
+| **16 B** | dispatch header（`get_dispatch_hdr_sz`）、token/scale 行、HT 的 `max_token_bytes` | `int4` 向量 load/store 与 TMA 行宽；FP4x2 要求逻辑 H 为 32 倍数，使物理 H/2 16B 对齐 |
+| **128 B** | LL `signal_slot_stride`、`NUM_BUFFER_ALIGNMENT_BYTES` | cache line / window 注册粒度；"清下一 bank"的线性扫描落在整齐边界；各 bank 起点同余类一致 |
+| **256 B** | HT IPC mega-buffer 各段、LL handle_mem、CFT fabric buffer | peer 指针 `base+offset` 必须保持同余类，否则 TMA 的 box 宽度假设失效；CFT 的 endpoint `bind_align` 粒度 |
+| **4096 B** | HT GIN mega-buffer | NIC/IOMMU 页与 GIN put 的硬件粒度；跨节点 window offset 必须页对齐，设备端才能直接用 `window+offset` 下发 |
+
+## 21. LL 缓冲布局与复用
+
+> **本章解决的问题**：如何在不重新分配的情况下反复使用接收缓冲，并让两阶段调用指向同一份数据。
+> **解决思路**：一整块 `rdma_buffer` 拆成 payload / signaling 两组双 bank，靠 `epoch&1` 选 bank。
+
+```
+偏移 0 ────────────────────── signal_slot_stride ────────────────────── 2×stride
+┌────────────────────────────┬────────────────────────────┐
+│ signaling bank 0           │ signaling bank 1           │  bank-major
+│ [signal][read_done][total] │ [signal][read_done][total] │
+└────────────────────────────┴────────────────────────────┘
+偏移 slot_base = 2×signal_slot_stride
+┌────────────────────────────┬────────────────────────────┐
+│ payload bank 0             │ payload bank 1             │
+│ [send][recv]（dispatch/combine 共享）│ 同上              │
+└────────────────────────────┴────────────────────────────┘
+```
+
+关键公式（`include/common.hpp:443-583`）：
+
+- `num_bytes_per_dispatch_msg = align(4 + topk×routerSize, 16) + max_token_bytes`
+- `num_bytes_per_combine_msg = align(max_token_bytes/2/128×sizeof(bfloat162) + max_token_bytes, 16)`
+- `slot_bytes = max(dispatch_send+dispatch_recv, combine_send+combine_recv)`，双 bank → `×2`
+- `signaling_buffer_bytes = max(L×R, E)×4`，`signal_slot_stride = align(signaling + read_done + total_token, 128)`
+
+**为什么三类 signaling 按 bank-major 打包**（`common.hpp:427-436`）：dispatch 和 combine 都能在一次线性扫描中清掉"下一个 bank 的 signal + read_done"。dispatch 自己从不读 read_done，但它的预清正好为随后落在该 bank 的 combine 准备好。`total_token` 放最后且**不清零**——每轮全量覆写，且读者只在确认 `recvCnt!=0` 后才读。
+
+**为什么 dispatch/combine 共享 payload 槽**（`common.hpp:503-506`）：两者从不同时执行，且 kernel 退出前已把收到的数据拷出到用户张量，recv buffer 不跨边界留存状态 → 取两者组合最大值即可，省一半内存。
+
+**AFD 的进一步别名**（`:508-520`）：AFD 中一个 rank 在一次操作里要么 sender 要么 receiver，四个逻辑区全部别名到 `slot_base`，取四者最大值；所有 rank 仍需完全一致的窗口布局（对称窗口要求）。
+
+**LSA split vs RDMA interleaved**：LSA 把 header 连续前置、payload 后置，使 payload 可**直接来自用户 inData**（零拷贝）且元数据扫描高效；RDMA 每槽一条 `[hdr|data|scales]`，一次 `gin.put` 自包含。`relativeRankSlot=(s-r+R)%R` 把不同发送方分散到接收方不同 source-rank 行，避免 NVLink 写热点。
+
+**realloc 的代价与约束**（`nccl_ep.cc:4039-4081`）：grow 流程是 `cudaDeviceSynchronize → ncclBarrier → deregister → free → ncclMemAlloc → memset(0) → register`。本地排空不够——远端可能仍通过 RDMA 访问旧窗口；注册/释放本身已是集合操作，故之后无需再 barrier。全零初始化是必须的，因为"未到达"语义就是 0。该调用是全 rank 集合操作、不允许在途通信、不能在 graph capture 中调用。规避：显式设 `rdma_buffer_size`，或提前创建所有 handle。mask 的 `sync_buffer` 独立注册 window，因大小只依赖 `nRanks`，不随 realloc 变动（`nccl_ep.cc:3130-3145`）。
+
+## 22. HT 缓冲布局与专用小块
+
+> **本章解决的问题**：节点内与跨节点的硬件粒度不同，如何组织 staging 与同步区。
+> **解决思路**：IPC mega-buffer（256B）与 GIN mega-buffer（4096B）各自一次大分配切段，按方向隔离流水两端。
+
+**IPC mega-buffer 六段**（`nccl_ep.cc:1349-1722`）：dispatch token、dispatch prob、dispatch meta tables（LERM 位图 + 每发送者 `[cnt_rank|cnt_expert]` 行）、combine token、combine prob、pull-count meta inbox。偏移用 `offset[n]=offset[n-1]+size[n-1]` 链式推导。**一个大分配的根本收益**：一次 `NCCL_WIN_COLL_SYMMETRIC` 注册 + 一次 `ncclGetPeerDevicePointer` 解析，kernel 只拿 `mega_base+offset`。
+
+- `skip_token_staging = zero_copy && !pull_push`：zero-copy 时用户 window 直收，省两个 token 区；pull-push 例外——非 window pull 回退仍需 staging token 行和前向权重。
+- **QUANT_FWD 的 scales 无独立区**，从 token 槽尾部 slack 切出，所以省掉 staging 时调用方必须把 `outputs->scales` 也开窗。
+- group 创建时还没有 handle，用"假想 EM 能力探测" `dispatch_push_count_capable(group, EXPERT_MAJOR)` 定尺寸，保证未来任何 handle 装得下；pull-count 能力必须 `ncclAllGatherHost` 校验全 rank 一致，否则某 rank 会算出越界的 NVLink 指针（`:1465-1479`）。
+
+**几个专用小块**：
+
+- `dev_counter_block`（40B）：expected GIN/LSA flag + grid-barrier/head-sync 计数器。dispatch tail 与 combine head 对同一 flag "加 1 并等期望值"，使 CUDA Graph replay 跨轮自定序，host 不必每轮同步。
+- `host_ptr_block`：`cudaHostAllocMapped` 的 7 组 per-LSA-rank 设备指针数组，作为 `__grid_constant__` 传入 kernel；host 每次调用可低成本改写（如 QUANT_FWD scale 指针），device 直接读。
+- `completion_flags_base`：2 个 uint，所有 LSA S2G 汇聚到 rank0 的单一 flag。
+- `global_topk_idx / global_routing_map`：按 `MAX_NUM_TOPK` 上限分配、由 AllGather 构建、全 handle 共享 → 只能 group 所有。
+- `scan_scratch` 拆成三个独立 lazy 分配：若合成一块动态增长，后来的 EM handle 触发扩容会让已创建 handle 缓存的设备指针悬空。
+
+**GIN mega-buffer（4096B）**：切出 combine RED/G2S tokens 与 prob、G2S flags、guard、token staging、dense prob、RDMA send/recv packed。
+
+- **RED 与 G2S 必须物理分离**：前者是"本地规约→发往远端"的着陆区，后者是"远端规约→本地 NVLink fan-out"的着陆区；方向相反、生产者消费者不同，分开后才能独立 guard/flag/清零，避免本地 RED 写踩到远端刚落但 G2S 未读完的行。
+- **dispatch packed entry**：`[token|prob|scales]` 打成一个 `bytes_per_entry = max_token_bytes + E×L×4`，每 token 只需一次 RDMA put + 一个 signal；分配端按 dense 保守取，compact 是运行期优化。
+- `GIN_WINDOW=8` 限制单 channel 在途 chunk；`×(3×chunk+1)` 因一个 token 最多 3 个 WQE（token/prob/scale）+ 1 个 signal。
+
+**workspace 的 count-only 优化**（`:2883-2917`）：`workspace = ht_count_only ? align256(counter_region) : 32MB`。count-capable 组用设备直方图重建接收表、不再跑 global scan，只需几十~几百字节；32MB 是 scan tmp 按 `device_sm_count` 计算的上界，一次分配服务所有 handle。
+
+**handle 的 `preprocessing_block` 按填值方式分三段**：`zero_region` 清零；`s2d + wire_pos` 填 0xFF（无效 source position，让 BWD 跳过陈旧梯度）；其余每轮由 kernel 完整写入以省一次 memset。`own_row` 紧跟 count 字段，使一次 memset 覆盖三者；`lerm_landing` 别名 IPC meta table 的 LERM 区，避免跨 rank 复制。
+
+## 23. 调用方张量定尺寸与所有权
+
+> **本章解决的问题**：eager / 溢出 / 量化如何改变调用方必须分配的字节数。
+> **解决思路**：区分库 staging（静态最坏预留）与调用方输出（可按实际计数分配）。
+
+- **静态**：`num_recv_slots = max_recv_tokens_per_rank`，CUDA Graph capture **必须**用这种。
+- **eager**（`max_recv_tokens=AUTO`）：D2H 读 `recv_total_counter` 后分配；EM 必须设 `num_topk`；禁 graph capture 与 DROP。
+- **EM padding**：`padded_e = ceil(c_e/A)×A`，最大冗余 `num_local_experts×(A-1)`；eager EM 内部预算须显式加上冗余，否则合法 padding 槽触发越界断言。
+- **DROP 不允许缩小缓冲**：地址计算依赖固定 `recv_max_slots`；`recv_total_counter` 始终报 **pre-drop** 真实总数，差值即 drop 检测信号。
+- **phantom row**：staging 丢弃的 token 仍可能占用容量内 EM 槽，必须零填充；`expert_counters[e]` 因此是**上界**而非精确值。
+- **`max_token_bytes`**：单行物理字节预算（含 scales），HT 要求 16 倍数；QUANT_FWD 要求 `token_bytes + scale_bytes ≤ max_token_bytes`。
+
+`handle_mem` 可调用者提供（1D `ncclUint8`，`sizes[0] ≥ ncclEpHandleMemSize`）：此时 handle 只包装、`owns_handle_mem=false`，销毁只释放结构体——这正是 `ncclEpImportHandle` 从快照重建、接入框架内存池与 CUDA Graph 复用的基础。
+
+---
+
+# 第七部分：支撑机制
+
+## 24. JIT
 
 > **本章解决的问题**：特化维度爆炸（算法×layout×dtype×recipe×warp×架构）无法 AOT 穷举。
 > **解决思路**：host 只打包参数，枚举变模板实参；三级缓存 + 指纹失效。
@@ -374,7 +494,7 @@ flowchart TD
 
 `FastCacheKey={identity, runtime_key, CUcontext, device}`（`device/jit/jit_runtime.cc:82-105`）；磁盘键包含完整源码与头文件树指纹，改头/换编译器/改 flag 自动失效。`jit_source_literals.hpp` 把 `layout_literal` / `dispatch_recipe_literal` / `combine_recipe_literal` 等转成模板实参，`*_name_tag` 进入 variant_name。
 
-## 20. 量化 Recipe
+## 25. 量化 Recipe
 
 > **本章解决的问题**：降低 wire 字节数，同时保持可验证的数值契约。
 > **解决思路**：四种 recipe，各有明确 tensor 契约与编译期 traits 约束。
@@ -390,9 +510,9 @@ MXFP8 解码用位技巧 `e8m0_to_scale(e)=__uint_as_float(uint32(e)<<23)` 得�
 
 ---
 
-# 第七部分：运维与工程
+# 第八部分：运维与工程
 
-## 21. 环境变量、兼容性与工程约定
+## 26. 环境变量、兼容性与工程约定
 
 > **本章解决的问题**：如何诊断、部署并不破坏既有代码风格。
 > **解决思路**：env 集中解析；兼容性集中检查；内部规范显式列出。
@@ -456,6 +576,9 @@ MXFP8 解码用位技巧 `e8m0_to_scale(e)=__uint_as_float(uint32(e)<<23)` 得�
 5. DROP 顺序：门控 → clamp → 清 combine gate → zero-fill。
 6. 量化对齐：token/scale 行、基址、window offset 16B 对齐；MXFP8/DSFP8 hidden%512==0。
 7. 协议编码：到达 flag `-(n+1)`；`FINISHED_SUM_TAG=16384`、点火值 `32768`；`ctaDone` 以 `prev+1==numSms` 选 last CTA。
+8. 缓冲 offset-only：handle 只存相对基址的偏移，使 `rdma_buffer` 可集体 realloc 而不使 live handle 失效。
+9. 窗口内存由 `ncclMemAlloc` 分配（对称注册 + RDMA 可达）；自定义 allocator 只覆盖不进窗口的块。
+10. 析构顺序：window 先于内存、devComm 先于 comm；HT 的 RED 与 G2S 区物理隔离、独立 guard。
 
 # 附录 C：关键源码索引
 
